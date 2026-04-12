@@ -173,6 +173,130 @@ Em escala: adicionar proxy rotation (R$500-1000/mes) e separar Redis/PostgreSQL 
 | Uptime scraper | >95% | >99,5% |
 | Volume indexado | >50.000 (SP) | >500.000 (Brasil) |
 
+## Proteção Anti-Bot (genérico para qualquer plataforma)
+
+Estas práticas se aplicam a qualquer plataforma que o CarBot for coletar dados (OLX, Webmotors, iCarros, Mercado Livre, etc). O objetivo é que o scraper se comporte indistintamente de um usuário real navegando.
+
+### Princípios
+
+O scraper deve parecer um humano navegando em velocidade normal. Sistemas anti-bot detectam anomalias estatísticas: intervalos regulares demais, volume alto demais, headers ausentes, falta de cookies, padrões sequenciais. A defesa é eliminar cada uma dessas anomalias.
+
+### Headers HTTP obrigatórios
+
+Toda requisição deve incluir o conjunto completo de headers que um browser real envia:
+
+```
+User-Agent: (rotacionar entre 5-10 strings reais — ver pool abaixo)
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.5,en;q=0.3
+Accept-Encoding: gzip, deflate, br
+Connection: keep-alive
+Upgrade-Insecure-Requests: 1
+Sec-Fetch-Dest: document
+Sec-Fetch-Mode: navigate
+Sec-Fetch-Site: none
+Sec-Fetch-User: ?1
+Referer: (URL da página anterior ou homepage da plataforma)
+```
+
+**Pool de User-Agents (atualizar semestralmente):**
+Manter 5-10 User-Agent strings de versões recentes do Chrome e Firefox em Windows/Mac/Linux. Rotacionar por sessão (não por request — um humano real não troca de browser a cada página).
+
+### Gerenciamento de Sessão e Cookies
+
+1. Antes de iniciar qualquer coleta, fazer GET na homepage da plataforma para obter cookies de sessão
+2. Manter cookie jar por sessão usando `httpx.AsyncClient` com cookies persistentes
+3. Requests sem cookies são flag imediata de bot — nunca fazer request "limpa"
+4. Se receber Set-Cookie durante a coleta, aceitar e reenviar nos requests seguintes
+
+### Controle de Timing (Jitter)
+
+Intervalo fixo entre requests é o padrão mais óbvio de bot. Usar jitter aleatório:
+
+```python
+import random
+
+def next_delay():
+    # Distribuição log-normal: maioria entre 1-2s, alguns até 4s
+    base = random.lognormvariate(0.3, 0.4)
+    return max(0.8, min(base, 5.0))  # clamp entre 0.8s e 5.0s
+```
+
+Média efetiva: ~1.5 req/segundo. Máximo sustentável: ~2.400 req/hora.
+
+Além do jitter por request, inserir pausas maiores (10-30 segundos) a cada 20-40 requests para simular "humano lendo resultados".
+
+### Intercalação de Segmentos
+
+Nunca fazer mais de 30 requisições seguidas para o mesmo path/segmento de busca. Intercalar entre segmentos diferentes. Um humano real não navega 100 páginas seguidas do mesmo filtro.
+
+```
+Padrão BOM:  3pp SUV → 3pp Sedã → 3pp Hatch → 3pp Pick-up → (pausa) → repete
+Padrão RUIM: 100pp Pick-up → 100pp SUV → 100pp Sedã (sequencial por segmento)
+```
+
+### Tratamento de Erros e Rate Limiting
+
+| HTTP Status | Significado | Ação |
+|---|---|---|
+| 200 | OK | Processar normalmente |
+| 403 | Bloqueado/Forbidden | Parar segmento, backoff 5 min, trocar User-Agent |
+| 429 | Rate Limited | Parar TUDO, backoff 10 min, reduzir velocidade 50% |
+| 503 | Server Overloaded | Retry em 30s, máximo 3 tentativas |
+| 5xx | Erro do servidor | Retry com backoff exponencial: 30s, 60s, 120s |
+
+**Regras de backoff:**
+- Após 403: pausar aquele segmento por 5 minutos, continuar outros segmentos
+- Após 429: pausar TODA a coleta por 10 minutos, depois retomar com delay 2x maior
+- Após 3 erros 403 no mesmo ciclo: abortar ciclo, tentar no próximo
+- Nunca retentar imediatamente — sempre esperar pelo menos 30 segundos
+
+**Logging:** registrar todo 403/429 com timestamp, URL, e User-Agent usado. Permite identificar se há padrão (ex: sempre bloqueia após página 50, ou bloqueia em horário X).
+
+### Limite de Volume por Plataforma
+
+| Plataforma | Req/hora seguro (MVP) | Req/hora escala (com proxy) |
+|---|---|---|
+| OLX | 500-750 | 3.000-5.000 |
+| Webmotors | 300-500 (estimar) | 2.000-3.000 |
+| iCarros | 300-500 (estimar) | 2.000-3.000 |
+| Mercado Livre | Via API oficial | Via API oficial |
+
+Estes são limites conservadores. Ajustar com base no monitoramento de erros 403/429.
+
+### Proxy Rotation (escala)
+
+Desnecessário no MVP (<750 req/hora). Quando necessário:
+
+- Usar pool de proxies residenciais (não datacenter — datacenter IPs são detectados facilmente)
+- Serviços recomendados: BrightData, ScraperAPI, Oxylabs (~R$500-1000/mês)
+- Rotacionar por sessão (não por request) — manter mesmo IP durante 20-40 requests
+- Priorizar proxies brasileiros (mesmo país do site alvo)
+
+### Checklist de Detecção Anti-Bot
+
+Antes de cada deploy do scraper, verificar:
+
+```
+[ ] User-Agent rotacionado entre 5-10 strings reais de browsers atuais
+[ ] Headers completos (Accept, Accept-Language, Referer, Sec-Fetch-*)
+[ ] Cookie jar ativo com sessão iniciada na homepage
+[ ] Jitter entre requests (0.8-5.0s, distribuição log-normal)
+[ ] Intercalação entre segmentos (máx 30 req seguidas no mesmo path)
+[ ] Pausas longas (10-30s) a cada 20-40 requests
+[ ] Backoff implementado para 403/429/5xx
+[ ] Limite de volume respeitado por plataforma
+[ ] Logging de todos os erros HTTP com timestamp e URL
+[ ] Proxy rotation configurado (se volume > 750 req/hora)
+```
+
+### Fingerprint e Detecção Avançada
+
+Plataformas maiores podem usar fingerprinting mais sofisticado:
+- **TLS fingerprint (JA3):** httpx e requests geram fingerprints diferentes dos browsers. Se bloqueado mesmo com headers corretos, considerar usar `curl_cffi` ou `tls-client` que emulam TLS de browsers reais.
+- **Behavioral analysis:** Se a plataforma rastreia padrões de navegação (ex: sempre entra direto na página 1 sem passar pela home), adicionar requests "decorativos" ocasionais (home, página de categoria).
+- **JavaScript challenges:** Se a plataforma passar a exigir execução de JS (Cloudflare, DataDome), HTTP direto não funciona. Nesse caso, fallback para Playwright com stealth plugin.
+
 ## Documentos Relacionados
 
 - `CarBot_Modelo_de_Negocio_e_Requisitos.docx` - modelo de negocio, user stories, roadmap

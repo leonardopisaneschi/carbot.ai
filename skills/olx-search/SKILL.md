@@ -328,3 +328,115 @@ Se o JavaScript retornar esse erro, evitar incluir URLs ou query strings no outp
 | Todos os carros em SP | 174.979 |
 | Pick-up + Diesel + Auto + <R$100k + <200k km | 293 |
 | Pick-up + Diesel/Flex + Auto + <R$100k + <200k km | 904 |
+| Pick-up + Diesel + Auto + <R$100k + abaixo FIPE | 432 |
+
+---
+
+## Estratégia de Coleta OLX
+
+O OLX tem ~175.000 veículos só em SP, mas limita a 100 páginas por busca (5.000 anúncios). Uma busca única "todos os carros de SP" pega apenas os 5.000 primeiros. A estratégia se divide em duas fases: crawl completo inicial e coletas incrementais.
+
+### Fase 1 — Crawl Completo (primeira execução)
+
+Segmentar por tipo de veículo (`ctp`) + faixa de preço (`ps`/`pe`) para que cada busca fique abaixo de 5.000 resultados:
+
+| Segmento | ctp | Faixas de preço | Volume estimado | Buscas |
+|---|---|---|---|---|
+| Pick-up | 3 | 0-80k / 80k-150k / 150k+ | ~8.000 | 3 |
+| SUV | 5 | 0-50k / 50-80k / 80-120k / 120-200k / 200k+ | ~35.000 | 5 |
+| Sedã | 8 | 0-30k / 30-60k / 60-100k / 100-200k / 200k+ | ~45.000 | 5 |
+| Hatch | 9 | 0-25k / 25-50k / 50-80k / 80k+ | ~55.000 | 4 |
+| Van/Utilitário | 7 | 0-80k / 80k+ | ~8.000 | 2 |
+| Conversível+Coupé+Perua+Outros | 2,6,10,11,12 | 0-80k / 80k+ | ~24.000 | 4 |
+| **TOTAL** | | | **~175.000** | **~23 buscas** |
+
+Cada busca pode ter até 100 páginas. Total estimado: ~3.500 páginas. A 1 req/segundo com jitter, ~58 minutos para popular o banco inteiro de SP.
+
+**Regra de segmentação:** se uma busca retorna `totalOfAds > 4.500`, subdividir por faixa de preço adicional ou por combustível (`fu`). Verificar sempre o campo `totalOfAds` do `pageProps` para confirmar cobertura.
+
+### Fase 2 — Coleta Incremental (a cada 2 horas)
+
+Ao invés de re-coletar tudo, usar `sp=date` (ordenar por mais recentes) e varrer até encontrar um anúncio já conhecido no banco.
+
+**Lógica:**
+1. Para cada segmento configurado, fazer GET com `sp=date&o=1`
+2. Parsear anúncios, verificar `listId` contra o banco
+3. Se todos os anúncios da página são novos, avançar para `o=2`, `o=3`...
+4. Quando encontrar o primeiro `listId` já conhecido, parar aquele segmento
+5. Persistir novos anúncios no Redis + PostgreSQL
+
+**Volume estimado por ciclo:**
+Um veículo seminovo fica ~15-30 dias anunciado. Com ~175k anúncios ativos, entram ~500-1.500 novos a cada 2 horas (175k / 20 dias média / 12 ciclos por dia). Isso são ~10-30 páginas por segmento, ou ~75-150 requisições totais. A 1 req/segundo, **1 a 3 minutos** ao invés de 58.
+
+### Detecção de Alteração de Preço
+
+Além dos novos, queremos detectar anúncios existentes que mudaram de preço.
+
+**Estratégia:** a cada ciclo, escolher aleatoriamente 10-20% dos segmentos e fazer scan mais profundo (20-30 páginas), comparando `preco` com o último `ad_snapshot` no PostgreSQL. Se houver diferença, criar novo snapshot.
+
+**Sinais valiosos para o comprador:**
+- "O preço caiu R$5.000 na última semana" → oportunidade
+- "O preço subiu R$3.000" → vendedor testando mercado
+- "3 reduções de preço em 30 dias" → vendedor desesperado, boa margem de negociação
+
+**Volume:** ~200-400 requests por ciclo (~3-7 minutos)
+
+### Detecção de Anúncios Removidos
+
+Anúncios podem ser removidos por venda, expiração ou exclusão do vendedor. Precisamos marcar como `status = removido` no banco.
+
+**Estratégia:** a cada ciclo, pegar uma amostra de anúncios ativos no banco que não foram vistos na última coleta incremental. Fazer HEAD request na URL original:
+- HTTP 200 → ainda ativo, manter
+- HTTP 404/410 → removido, atualizar status e `removed_at`
+- HTTP 403/429 → rate limited, tentar no próximo ciclo
+
+**Volume:** ~100-200 requests por ciclo (~2-3 minutos)
+
+**Inteligência derivada:**
+- Tempo médio de venda por modelo/região (diferença entre `first_seen_at` e `removed_at`)
+- "Este modelo costuma ser vendido em 8 dias nessa faixa" → urgência legítima baseada em dados
+
+### Budget Total de Requests por Ciclo (2h)
+
+| Operação | Requests | Tempo estimado |
+|---|---|---|
+| Incremental (novos anúncios) | 75-150 | ~2 min |
+| Detecção de alteração de preço | 200-400 | ~5 min |
+| Verificação de removidos | 100-200 | ~3 min |
+| **TOTAL** | **375-750** | **~10 min** |
+
+Sobra 1h50 de folga na janela de 2h. O budget fica muito abaixo do limite de rate limiting (~3.600 req/hora a 1 req/s).
+
+### Intercalação de Segmentos
+
+Nunca fazer mais de 30 requisições seguidas para o mesmo segmento de busca. Intercalar para simular comportamento humano:
+
+```
+Ciclo exemplo:
+  3 páginas Pick-up 0-80k
+  3 páginas SUV 0-50k
+  3 páginas Sedã 0-30k
+  3 páginas Hatch 0-25k
+  3 páginas Pick-up 80k-150k
+  ... (rotação)
+```
+
+Isso distribui as requisições entre diferentes URLs e evita padrão de acesso sequencial que dispara detecção de bot.
+
+### Campos-chave para Dedup e Tracking
+
+| Campo | Uso |
+|---|---|
+| `listId` | ID único do anúncio — chave primária para dedup |
+| `origListTime` | Timestamp original da publicação — detecta "republicações" (mesmo carro, novo anúncio) |
+| `date` | Timestamp da última atualização — detecta bumps/destaques |
+| `lastBumpAgeSecs` | Segundos desde o último bump — "0" significa bump recente |
+| `price` / `priceValue` | Comparar com último snapshot para detectar alteração |
+| `professionalAd` | Loja vs PF — padrões de comportamento diferentes |
+
+### Detecção de Republicação (mesmo carro, novo anúncio)
+
+Vendedores frequentemente deletam e recriam o anúncio para aparecer como "novo". Detectar comparando:
+- Mesmo `vehicle_brand` + `vehicle_model` + `regdate` + `mileage` (±5%) + mesma cidade
+- `listId` diferente mas perfil muito similar
+- Marcar como `republished_from = listId_anterior` no banco
